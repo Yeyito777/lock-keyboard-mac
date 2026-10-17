@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""A keyboard-only lock using the user's existing Karabiner-Elements service."""
+
+import argparse
+import copy
+import datetime
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+CLI = Path("/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli")
+CONFIG = Path.home() / ".config/karabiner/karabiner.json"
+SELF = Path(__file__).resolve()
+DESCRIPTION = "Keyboard lock: physical Esc locks; Shift+Esc unlocks"
+VARIABLE = "exo_keyboard_locked"
+SHIFT_VARIABLES = ["exo_keyboard_lock_left_shift", "exo_keyboard_lock_right_shift"]
+CAPS_MAPPING = {"from": {"key_code": "caps_lock"}, "to": [{"key_code": "escape"}]}
+LED_HELPER = SELF.with_name("caps-led")
+MESSAGES = {"on": "Keyboard locked — Shift+Esc to unlock", "off": "Keyboard unlocked"}
+
+
+def condition(name, value=1, unless=False):
+    return {"type": "variable_unless" if unless else "variable_if",
+            "name": name, "value": value}
+
+
+def variable(name, value):
+    return {"set_variable": {"name": name, "value": value}}
+
+
+def notification_script(state):
+    return (f"display notification {json.dumps(MESSAGES[state], ensure_ascii=False)} "
+            'with title "Keyboard Lock"')
+
+
+def indicator_action(state):
+    # Cosmetic only: the lock itself is the Karabiner variable. One exec'd
+    # process, because Karabiner SIGKILLs a still-running shell_command when the
+    # next one starts; helper children would survive and could apply stale LEDs.
+    return {"shell_command": shlex.join(["exec", str(LED_HELPER), state, "/usr/bin/osascript",
+                                         "-e", notification_script(state)])}
+
+
+def make_rule():
+    manipulators = []
+    # Do NOT pass Shift to macOS while locked. Track it ourselves so the unlock
+    # chord works even though the catch-all suppresses every modifier key.
+    for key, name in zip(["left_shift", "right_shift"], SHIFT_VARIABLES):
+        manipulators.append({
+            "type": "basic",
+            "from": {"key_code": key, "modifiers": {"optional": ["any"]}},
+            "conditions": [condition(VARIABLE)],
+            "to": [variable(name, 1)],
+            "to_after_key_up": [variable(name, 0)],
+        })
+    for name in SHIFT_VARIABLES:
+        manipulators.append({
+            "type": "basic",
+            "from": {"key_code": "escape", "modifiers": {"optional": ["any"]}},
+            "conditions": [condition(VARIABLE), condition(name)],
+            "to": [{"key_code": "vk_none"}],
+            # Unlock inside Karabiner on release (a held Esc cannot relock), so it
+            # never waits for, or depends on, the indicator command finishing.
+            "to_after_key_up": [
+                variable(VARIABLE, 0),
+                *[variable(n, 0) for n in SHIFT_VARIABLES],
+                indicator_action("off"),
+            ],
+        })
+    manipulators.append({
+        "type": "basic",
+        "from": {"key_code": "escape", "modifiers": {"optional": ["caps_lock"]}},
+        "conditions": [condition(VARIABLE, unless=True)],
+        "to": [
+            variable(VARIABLE, 1),
+            *[variable(n, 0) for n in SHIFT_VARIABLES],
+            {"key_code": "vk_none"},
+            indicator_action("on"),
+        ],
+    })
+    # These four HID categories are supported by installed Karabiner 16.0.0.
+    # Deliberately do not match pointing_button: the mouse/trackpad stays usable.
+    for category in ["key_code", "consumer_key_code",
+                     "apple_vendor_keyboard_key_code", "apple_vendor_top_case_key_code"]:
+        manipulators.append({
+            "type": "basic",
+            "from": {"any": category, "modifiers": {"optional": ["any"]}},
+            "conditions": [condition(VARIABLE)],
+            "to": [{"key_code": "vk_none"}],
+        })
+    # Simple modifications run BEFORE complex modifications. Moving the
+    # existing Caps->Esc mapping here keeps physical Caps separate from Esc,
+    # and generated Escape does not get reprocessed by this rule block.
+    manipulators.append({
+        "type": "basic",
+        "from": {"key_code": "caps_lock", "modifiers": {"optional": ["any"]}},
+        "to": [{"key_code": "escape"}],
+    })
+    return {"description": DESCRIPTION, "manipulators": manipulators}
+
+
+def selected_profile(config):
+    selected = [p for p in config["profiles"] if p.get("selected")]
+    if len(selected) != 1:
+        raise RuntimeError("Expected exactly one selected Karabiner profile.")
+    return selected[0]
+
+
+def installed(profile):
+    return any(r.get("description") == DESCRIPTION
+               for r in profile.get("complex_modifications", {}).get("rules", []))
+
+
+def prepare_install(config):
+    result = copy.deepcopy(config)
+    profile = selected_profile(result)
+    rules = profile.setdefault("complex_modifications", {}).setdefault("rules", [])
+    if installed(profile):
+        # Update just our own rule, not unrelated modifications.
+        rules[:] = [r for r in rules if r.get("description") != DESCRIPTION]
+    else:
+        modifications = profile.setdefault("simple_modifications", [])
+        caps = [m for m in modifications if m.get("from", {}).get("key_code") == "caps_lock"]
+        if caps != [CAPS_MAPPING]:
+            raise RuntimeError("Expected existing Caps Lock -> Escape simple mapping; "
+                               "refusing to overwrite an unfamiliar setup.")
+        modifications.remove(CAPS_MAPPING)
+    rules.insert(0, make_rule())
+    return result
+
+
+def prepare_uninstall(config):
+    result = copy.deepcopy(config)
+    profile = selected_profile(result)
+    if not installed(profile):
+        return result
+    rules = profile["complex_modifications"]["rules"]
+    rules[:] = [r for r in rules if r.get("description") != DESCRIPTION]
+    modifications = profile.setdefault("simple_modifications", [])
+    # Do not overwrite a newer user-chosen Caps mapping.
+    if not any(m.get("from", {}).get("key_code") == "caps_lock" for m in modifications):
+        modifications.append(copy.deepcopy(CAPS_MAPPING))
+    return result
+
+
+def run_cli(*args):
+    if not CLI.is_file():
+        raise RuntimeError("Karabiner-Elements is not installed.")
+    result = subprocess.run([str(CLI), *args], capture_output=True, text=True, timeout=5)
+    if result.returncode or "error" in result.stderr.lower():
+        raise RuntimeError((result.stderr or result.stdout).strip() or "Karabiner CLI failed.")
+    return result.stdout
+
+
+def set_lock(state):
+    # Signed Karabiner CLI is the supported route; no root access or custom IPC.
+    values = {VARIABLE: int(state), **{name: 0 for name in SHIFT_VARIABLES}}
+    run_cli("--set-variables", json.dumps(values))
+
+
+def set_led(state):
+    result = subprocess.run([str(LED_HELPER), state], capture_output=True, text=True, timeout=3)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Caps Lock LED update failed.")
+    return result.stdout
+
+
+def ensure_led_helper():
+    source = LED_HELPER.with_suffix(".c")
+    if LED_HELPER.exists() and LED_HELPER.stat().st_mtime >= source.stat().st_mtime:
+        return
+    temporary = LED_HELPER.with_name(".caps-led-build")
+    result = subprocess.run(
+        ["/usr/bin/clang", "-O2", "-Wall", "-Wextra", str(source),
+         "-framework", "IOKit", "-framework", "CoreFoundation", "-o", str(temporary)],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Could not build Caps Lock LED helper.")
+    os.replace(temporary, LED_HELPER)
+
+
+def transition(state):
+    # The lock is only the Karabiner variable; the LED is cosmetic, so its
+    # failure is reported without undoing (or blocking) the lock change.
+    set_lock(state)
+    try:
+        set_led("on" if state else "off")
+    finally:
+        notify("on" if state else "off")
+
+
+def notify(state):
+    # Secondary indication, subject to macOS notification/Focus settings.
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", notification_script(state)],
+                       capture_output=True, timeout=3, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # Notification failure must never prevent unlocking.
+
+
+def write_config(original, config):
+    # Detect concurrent edits and keep a timestamped recovery copy.
+    if CONFIG.read_bytes() != original:
+        raise RuntimeError("Karabiner config changed concurrently; please retry.")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup = CONFIG.with_name(f"karabiner.json.bak-keyboard-lock-{stamp}")
+    shutil.copy2(CONFIG, backup)
+    fd, temporary = tempfile.mkstemp(prefix=".keyboard-lock-", dir=CONFIG.parent)
+    try:
+        os.fchmod(fd, CONFIG.stat().st_mode & 0o777)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(config, handle, indent=4, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if CONFIG.read_bytes() != original:
+            raise RuntimeError("Karabiner config changed concurrently; please retry.")
+        os.replace(temporary, CONFIG)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return backup
+
+
+def lint(rule):
+    with tempfile.TemporaryDirectory(prefix="keyboard-lock-lint-") as directory:
+        path = Path(directory) / "keyboard-lock.json"
+        path.write_text(json.dumps({"title": "Keyboard Lock", "rules": [rule]}))
+        return run_cli("--lint-complex-modifications", str(path)).strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lock the keyboard, not the screen. Mouse/trackpad stays usable.",
+        epilog="Physical Esc locks; either Shift+Esc unlocks. Caps Lock remains normal Escape.")
+    parser.add_argument("command", choices=["on", "off", "check", "install", "uninstall"])
+    args = parser.parse_args()
+    if args.command == "off":
+        # Unconditional emergency recovery, even if config was edited/deleted.
+        transition(False)
+        print("Keyboard unlocked; Caps Lock LED back to normal.")
+        return
+    original = CONFIG.read_bytes()
+    config = json.loads(original)
+    profile = selected_profile(config)
+    if args.command == "check":
+        rules = profile.get("complex_modifications", {}).get("rules", [])
+        current = [r for r in rules if r.get("description") == DESCRIPTION]
+        state = ("not installed" if not current else
+                 "installed" if current == [make_rule()] else "outdated; run install")
+        print(f"Profile: {profile['name']}")
+        print(f"Rules: {state}")
+        print(lint(make_rule()))
+        print(f"Caps Lock LED helper: {set_led('status').strip()}")
+        print("This checks setup, not live lock state; physical key testing is required.")
+    elif args.command == "install":
+        updated = prepare_install(config)
+        lint(make_rule())
+        ensure_led_helper()
+        transition(False)
+        backup = write_config(original, updated)
+        print(f"Installed. Backup: {backup}")
+        print("Physical Esc locks; Shift+Esc unlocks. Caps Lock remains Escape.")
+    elif args.command == "uninstall":
+        transition(False)
+        backup = write_config(original, prepare_uninstall(config))
+        print(f"Removed; restored Caps Lock -> Escape. Backup: {backup}")
+    elif args.command == "on":
+        if not installed(profile):
+            raise RuntimeError("Run lock-keyboard install first.")
+        transition(True)
+        print("Keyboard locked; Caps Lock LED on. Shift+Esc to unlock.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"lock-keyboard: {error}", file=sys.stderr)
+        sys.exit(1)
